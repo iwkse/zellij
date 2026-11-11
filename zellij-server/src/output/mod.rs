@@ -1802,6 +1802,22 @@ fn wire_cursor_shape(csi: &str) -> u8 {
     }
 }
 
+// A cursor outside of a client's cropped view is reported as hidden.
+fn client_cursor_within(
+    client_cursor: &HashMap<ClientId, CursorState>,
+    client_id: ClientId,
+    limit: Option<Size>,
+) -> Option<CursorState> {
+    client_cursor.get(&client_id).copied().map(|mut cursor| {
+        if let Some(limit) = limit {
+            if cursor.y as usize >= limit.rows || cursor.x as usize >= limit.cols {
+                cursor.visible = false;
+            }
+        }
+        cursor
+    })
+}
+
 fn frame_builder_for(
     clients: &Rc<RefCell<HashMap<ClientId, StructuredClientState>>>,
     client_id: ClientId,
@@ -1982,6 +1998,8 @@ pub struct Output {
     pub collect_ansi_pane_contents: bool,
     cursor_coordinates: Option<(usize, usize)>,
     client_cursor: HashMap<ClientId, CursorState>,
+    // Clients viewing a tab larger than their terminal: their output is cropped to this size
+    client_viewport_limits: HashMap<ClientId, Size>,
 }
 
 impl Output {
@@ -2024,6 +2042,9 @@ impl Output {
             self.client_character_chunks.insert(*client_id, vec![]);
             self.client_pane_rects.insert(*client_id, vec![]);
         }
+    }
+    pub fn set_client_viewport_limits(&mut self, limits: HashMap<ClientId, Size>) {
+        self.client_viewport_limits = limits;
     }
     pub fn link_handler(&self) -> Option<Rc<RefCell<LinkHandler>>> {
         self.link_handler.clone()
@@ -2309,6 +2330,7 @@ impl Output {
                 .map(|state| state.enabled)
                 .unwrap_or(false);
             let mut client_serialized_render_instructions = String::new();
+            let viewport_limit = self.client_viewport_limits.get(&client_id).copied();
 
             // append pre-vte instructions for this client
             let mut host_display_cleared =
@@ -2317,7 +2339,7 @@ impl Output {
                 let mut builder = frame_builder_for(
                     &self.structured_render_clients,
                     client_id,
-                    self.client_cursor.get(&client_id).copied(),
+                    client_cursor_within(&self.client_cursor, client_id, viewport_limit),
                 )
                 .with_context(|| {
                     format!(
@@ -2393,10 +2415,20 @@ impl Output {
             };
 
             if let Some(mut builder) = structured_builder.take() {
-                let panes = self
+                let mut panes = self
                     .client_pane_rects
                     .remove(&client_id)
                     .unwrap_or_default();
+                if let Some(limit) = viewport_limit {
+                    let cols = limit.cols.min(u16::MAX as usize) as u16;
+                    let rows = limit.rows.min(u16::MAX as usize) as u16;
+                    panes = panes
+                        .into_iter()
+                        .filter_map(|(rect, scroll)| {
+                            rect.clip_to(cols, rows).map(|clipped| (clipped, scroll))
+                        })
+                        .collect();
+                }
                 let geometry_pushed = push_geometry_if_changed(
                     &self.structured_render_clients,
                     client_id,
@@ -2460,7 +2492,7 @@ impl Output {
                     Some(&mut self.sixel_image_store.borrow_mut()),
                     self.styled_underlines,
                     self.osc8_hyperlinks,
-                    None, // No size constraints for regular rendering
+                    viewport_limit,
                     kitty_input,
                 )
                 .with_context(err_context)?,
@@ -2473,6 +2505,15 @@ impl Output {
                 for vte_instruction in post_vte_instructions_for_client {
                     client_serialized_render_instructions.push_str(&vte_instruction);
                 }
+            }
+            if viewport_limit.is_some()
+                && client_cursor_within(&self.client_cursor, client_id, viewport_limit)
+                    .map(|cursor| !cursor.visible)
+                    .unwrap_or(false)
+            {
+                // the cursor is outside of this client's cropped view
+                vte_hide_cursor_instruction(&mut client_serialized_render_instructions)
+                    .with_context(err_context)?;
             }
             serialized_render_instructions.insert(
                 client_id,

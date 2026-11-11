@@ -3063,6 +3063,9 @@ pub(crate) fn route_thread_main(
                                 .write()
                                 .unwrap()
                                 .set_last_active_client(client_id);
+                            let _ = senders.as_ref().map(|s| {
+                                s.send_to_screen(ScreenInstruction::ClientActivity(client_id))
+                            });
 
                             // The read guard ends as a temporary in this expression so
                             // `route_action` runs without holding `session_data.read()` —
@@ -3221,6 +3224,11 @@ pub(crate) fn route_thread_main(
                             is_cli_client,
                         } => {
                             let cli_client_id = client_id;
+                            if !is_cli_client {
+                                let _ = senders.as_ref().map(|s| {
+                                    s.send_to_screen(ScreenInstruction::ClientActivity(client_id))
+                                });
+                            }
                             let client_id = if is_cli_client {
                                 // for cli clients, we want to default to the last active client
                                 // (i.e. the last client to have issued a keystroke) this is to

@@ -569,6 +569,7 @@ pub enum ScreenInstruction {
         completion_tx: Option<NotificationEnd>,
     },
     RecomputeTabSize(ClientId, Size),
+    ClientActivity(ClientId),
     TerminalPixelDimensions(ClientId, PixelDimensions),
     TerminalBackgroundColor(String),
     TerminalForegroundColor(String),
@@ -1383,6 +1384,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::RenameTabWithId(..) => ScreenContext::RenameTabWithId,
             ScreenInstruction::BreakPanesToTabWithId { .. } => ScreenContext::BreakPanesToTabWithId,
             ScreenInstruction::RecomputeTabSize(..) => ScreenContext::RecomputeTabSize,
+            ScreenInstruction::ClientActivity(..) => ScreenContext::ClientActivity,
             ScreenInstruction::TerminalPixelDimensions(..) => {
                 ScreenContext::TerminalPixelDimensions
             },
@@ -2080,6 +2082,10 @@ pub(crate) struct Screen {
     /// The indices of this [`Screen`]'s active [`Tab`]s.
     active_tab_ids: BTreeMap<ClientId, usize>,
     client_sizes: HashMap<ClientId, Size>,
+    // Monotonic stamps of the last user activity (input, terminal resize, focus-in, attach) per
+    // client. A tab takes the size of its most recently active client.
+    client_activity: HashMap<ClientId, u64>,
+    client_activity_counter: u64,
     global_last_active_tab_id: usize,
     tab_history: BTreeMap<ClientId, Vec<usize>>,
     pane_history: BTreeMap<ClientId, Vec<PaneId>>,
@@ -2455,6 +2461,8 @@ impl Screen {
             recently_disconnected_clients: VecDeque::new(),
             active_tab_ids: BTreeMap::new(),
             client_sizes: HashMap::new(),
+            client_activity: HashMap::new(),
+            client_activity_counter: 0,
             global_last_active_tab_id: 0,
             tabs: BTreeMap::new(),
             last_single_pane_tab_names: HashMap::new(),
@@ -3171,17 +3179,43 @@ impl Screen {
     pub fn recompute_tab_size(&mut self, tab_id: usize) -> Result<()> {
         let err_context = || format!("failed to recompute size for tab {tab_id}");
 
+        // The tab takes the size of its most recently active client (like tmux's `window-size
+        // latest`), so that attaching from a small device does not shrink the tab for everybody
+        // else. Clients smaller than the tab get a cropped view (see `client_viewport_limits`).
+        // Falls back to the smallest client when no client on the tab has recorded activity.
+        let new_size = match self.latest_active_client_on_tab(tab_id) {
+            Some(client_id) => match self.client_sizes.get(&client_id) {
+                Some(size) => *size,
+                None => return Ok(()),
+            },
+            None => match self.smallest_client_size_on_tab(tab_id) {
+                Some(size) => size,
+                None => return Ok(()),
+            },
+        };
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            if tab.size != new_size {
+                tab.resize_whole_tab(new_size).with_context(err_context)?;
+                tab.set_force_render();
+            }
+        }
+        Ok(())
+    }
+
+    fn client_fit_disabled(&self, client_id: &ClientId) -> bool {
+        self.mobile_web_prefs
+            .get(client_id)
+            .map(|prefs| !prefs.fit)
+            .unwrap_or(false)
+    }
+
+    fn smallest_client_size_on_tab(&self, tab_id: usize) -> Option<Size> {
         let mut rows: Vec<usize> = Vec::new();
         let mut cols: Vec<usize> = Vec::new();
         let mut fit_disabled_clients: Vec<ClientId> = Vec::new();
         for (client_id, active_tab) in self.active_tab_ids.iter() {
             if *active_tab == tab_id {
-                if self
-                    .mobile_web_prefs
-                    .get(client_id)
-                    .map(|prefs| !prefs.fit)
-                    .unwrap_or(false)
-                {
+                if self.client_fit_disabled(client_id) {
                     fit_disabled_clients.push(*client_id);
                     continue;
                 }
@@ -3197,22 +3231,75 @@ impl Screen {
                 cols.push(reference.cols);
             }
         }
-        if rows.is_empty() || cols.is_empty() {
+        Some(Size {
+            rows: rows.into_iter().min()?,
+            cols: cols.into_iter().min()?,
+        })
+    }
+
+    // Mobile web clients with fit disabled never drive the tab size: they follow a reference
+    // client instead.
+    fn latest_active_client_on_tab(&self, tab_id: usize) -> Option<ClientId> {
+        self.active_tab_ids
+            .iter()
+            .filter(|(client_id, active_tab)| {
+                **active_tab == tab_id
+                    && !self.client_fit_disabled(client_id)
+                    && self.client_sizes.contains_key(client_id)
+            })
+            .filter_map(|(client_id, _)| {
+                self.client_activity
+                    .get(client_id)
+                    .map(|stamp| (*stamp, *client_id))
+            })
+            .max()
+            .map(|(_stamp, client_id)| client_id)
+    }
+
+    // Records user activity of a client. Returns true if the client was not already the most
+    // recently active client of its tab, meaning the tab size might have to change.
+    fn record_client_activity(&mut self, client_id: ClientId) -> bool {
+        let tab_id = self.active_tab_ids.get(&client_id).copied();
+        let already_latest = tab_id
+            .map(|tab_id| self.latest_active_client_on_tab(tab_id) == Some(client_id))
+            .unwrap_or(false);
+        // always restamp, so that this client still counts as the most recent one when it
+        // moves to a tab shared with other clients
+        self.client_activity_counter += 1;
+        self.client_activity
+            .insert(client_id, self.client_activity_counter);
+        tab_id.is_some() && !already_latest
+    }
+
+    pub fn client_became_active(&mut self, client_id: ClientId) -> Result<()> {
+        if self.watcher_clients.contains_key(&client_id) {
             return Ok(());
         }
-        rows.sort_unstable();
-        cols.sort_unstable();
-        let new_size = Size {
-            rows: rows[0],
-            cols: cols[0],
-        };
-        if let Some(tab) = self.tabs.get_mut(&tab_id) {
-            if tab.size != new_size {
-                tab.resize_whole_tab(new_size).with_context(err_context)?;
-                tab.set_force_render();
+        if self.record_client_activity(client_id) {
+            if let Some(tab_id) = self.active_tab_ids.get(&client_id).copied() {
+                self.recompute_tab_size(tab_id)?;
+                self.render(None)?;
             }
         }
         Ok(())
+    }
+
+    // Clients smaller than the tab they are viewing (because another, larger client was more
+    // recently active) get their output cropped to their own terminal size.
+    fn client_viewport_limits(&self) -> HashMap<ClientId, Size> {
+        self.active_tab_ids
+            .iter()
+            .filter(|(client_id, _)| !self.watcher_clients.contains_key(client_id))
+            .filter_map(|(client_id, tab_id)| {
+                let client_size = self.client_sizes.get(client_id)?;
+                let tab_size = self.tabs.get(tab_id)?.size;
+                if client_size.rows < tab_size.rows || client_size.cols < tab_size.cols {
+                    Some((*client_id, *client_size))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn recompute_fit_disabled_tabs(&mut self) -> Result<()> {
@@ -5900,6 +5987,7 @@ impl Screen {
 
             output.collect_ansi_pane_contents =
                 self.pane_render_subscribers.values().any(|s| s.ansi);
+            output.set_client_viewport_limits(self.client_viewport_limits());
 
             for (tab_index, tab) in &mut self.tabs {
                 if tab.has_selectable_tiled_panes() {
@@ -6933,6 +7021,10 @@ impl Screen {
         if attach_to_first_tab_on_tiled_surface && tab.are_floating_panes_visible() {
             tab.hide_floating_panes();
         }
+        if !is_watcher {
+            // attaching counts as activity: the new client drives the tab size
+            self.record_client_activity(client_id);
+        }
         self.recompute_tab_size(tab_index)
             .with_context(|| err_context(tab_index))?;
         if !self.nested_ancestry.is_empty() || !self.host_descend_keys.is_empty() {
@@ -7050,6 +7142,7 @@ impl Screen {
             self.push_sixel_host_support_to_tabs();
         }
         self.client_sizes.remove(&client_id);
+        self.client_activity.remove(&client_id);
         self.client_display_slots.borrow_mut().remove(&client_id);
         self.release_structured_render_state(client_id);
         self.pane_render_subscribers.remove(&client_id);
@@ -13093,6 +13186,8 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::RecomputeTabSize(client_id, new_size) => {
                 screen.set_client_size(client_id, new_size);
+                // a terminal resize (eg. a soft keyboard showing up) counts as activity
+                screen.record_client_activity(client_id);
                 if screen.tabs.is_empty() {
                     continue;
                 }
@@ -13488,6 +13583,12 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::HostTerminalFocusChanged(client_id, focused) => {
                 screen.host_terminal_focus_changed(client_id, focused);
+                if focused {
+                    screen.client_became_active(client_id)?;
+                }
+            },
+            ScreenInstruction::ClientActivity(client_id) => {
+                screen.client_became_active(client_id)?;
             },
             ScreenInstruction::SetClientHostTerminalEnv(client_id, host_terminal_env) => {
                 screen.set_client_host_terminal_env(client_id, host_terminal_env);

@@ -11241,7 +11241,7 @@ fn recompute_tab_size_uses_lone_viewer_size() {
 }
 
 #[test]
-fn recompute_tab_size_takes_independent_min_across_axes() {
+fn recompute_tab_size_follows_most_recently_active_client() {
     let initial_size = Size {
         cols: 200,
         rows: 60,
@@ -11250,20 +11250,61 @@ fn recompute_tab_size_takes_independent_min_across_axes() {
     new_tab(&mut screen, 1, 0);
     screen.add_client(2, false).expect("TEST");
 
-    screen.set_client_size(
-        1,
-        Size {
-            cols: 200,
-            rows: 24,
-        },
-    );
-    screen.set_client_size(2, Size { cols: 80, rows: 60 });
+    let large_client_size = Size {
+        cols: 200,
+        rows: 60,
+    };
+    let small_client_size = Size { cols: 80, rows: 24 };
+    screen.set_client_size(1, large_client_size);
+    screen.set_client_size(2, small_client_size);
     screen.recompute_tab_size(0).expect("TEST");
 
     assert_eq!(
         screen.tabs.get(&0).unwrap().size,
-        Size { cols: 80, rows: 24 },
-        "Tab size = (min cols across viewers, min rows across viewers)"
+        small_client_size,
+        "Tab takes the size of the client that attached last"
+    );
+
+    screen.client_became_active(1).expect("TEST");
+    assert_eq!(
+        screen.tabs.get(&0).unwrap().size,
+        large_client_size,
+        "Tab grows back once the larger client is active again"
+    );
+
+    screen.client_became_active(2).expect("TEST");
+    assert_eq!(
+        screen.tabs.get(&0).unwrap().size,
+        small_client_size,
+        "Tab shrinks again once the smaller client is active"
+    );
+}
+
+#[test]
+fn smaller_inactive_client_gets_a_cropped_viewport() {
+    let initial_size = Size {
+        cols: 200,
+        rows: 60,
+    };
+    let mut screen = create_new_screen(initial_size, true, true);
+    new_tab(&mut screen, 1, 0);
+    screen.add_client(2, false).expect("TEST");
+
+    let small_client_size = Size { cols: 80, rows: 24 };
+    screen.set_client_size(1, initial_size);
+    screen.set_client_size(2, small_client_size);
+    screen.client_became_active(1).expect("TEST");
+
+    let limits = screen.client_viewport_limits();
+    assert_eq!(
+        limits.get(&2),
+        Some(&small_client_size),
+        "The smaller client's output is cropped to its own size"
+    );
+    assert_eq!(
+        limits.get(&1),
+        None,
+        "The client driving the tab size is not cropped"
     );
 }
 
@@ -11321,11 +11362,11 @@ fn switching_tabs_recomputes_source_and_destination() {
             rows: 50,
         },
     );
-    screen.recompute_tab_size(1).expect("TEST");
+    screen.client_became_active(1).expect("TEST");
     assert_eq!(
         screen.tabs.get(&1).unwrap().size,
         Size { cols: 80, rows: 24 },
-        "Both clients on tab 1 → it sizes to the smaller"
+        "Both clients on tab 1 → it sizes to the most recently active one"
     );
 
     screen.switch_active_tab(0, None, true, 1).expect("TEST");
@@ -11363,11 +11404,11 @@ fn creating_a_new_tab_recomputes_the_tab_its_creator_left() {
             rows: 50,
         },
     );
-    screen.recompute_tab_size(0).expect("TEST");
+    screen.client_became_active(1).expect("TEST");
     assert_eq!(
         screen.tabs.get(&0).unwrap().size,
         Size { cols: 80, rows: 24 },
-        "Pre-condition: both clients view tab 0, so it sizes to the smaller of them"
+        "Pre-condition: both clients view tab 0, so it sizes to the most recently active one"
     );
 
     new_tab(&mut screen, 2, 1);
@@ -11437,6 +11478,8 @@ fn break_pane_to_new_tab_recomputes_source_and_destination() {
             .unwrap();
     }
 
+    // the break-pane keystroke makes client 1 the most recently active client
+    screen.client_became_active(1).expect("TEST");
     screen
         .break_pane_to_new_tab(Direction::Right, 1)
         .expect("TEST");
@@ -11444,7 +11487,7 @@ fn break_pane_to_new_tab_recomputes_source_and_destination() {
     assert_eq!(
         screen.tabs.get(&1).unwrap().size,
         Size { cols: 80, rows: 24 },
-        "Destination tab shrinks to fit the arriving smaller viewer"
+        "Destination tab takes the size of the arriving, most recently active viewer"
     );
     assert_eq!(
         screen.tabs.get(&0).unwrap().size,
@@ -11504,6 +11547,8 @@ fn moving_panes_between_tabs_with_focus_change_recomputes_both() {
             .unwrap();
     }
 
+    // the keystroke moving the panes makes client 1 the most recently active client
+    screen.client_became_active(1).expect("TEST");
     screen
         .break_multiple_panes_to_tab_with_index(vec![pane_to_move], 0, true, 1)
         .expect("TEST");
@@ -11511,7 +11556,7 @@ fn moving_panes_between_tabs_with_focus_change_recomputes_both() {
     assert_eq!(
         screen.tabs.get(&0).unwrap().size,
         Size { cols: 80, rows: 24 },
-        "Destination tab shrinks to min(viewers) once the smaller client arrives"
+        "Destination tab takes the size of the arriving, most recently active viewer"
     );
     assert_eq!(
         screen.tabs.get(&1).unwrap().size,
